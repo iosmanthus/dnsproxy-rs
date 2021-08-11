@@ -1,0 +1,7 @@
+trace:
+  service_name: dnsproxy-rs
+  agent_endpoint: 127.0.0.1:6831
+bind_addresses:
+  - 127.0.0.1:5353
+plugins:
+  - name: cache
