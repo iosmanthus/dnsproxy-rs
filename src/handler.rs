@@ -9,40 +9,51 @@ use anyhow::{anyhow, Result};
 use tokio::net::UdpSocket;
 
 use trust_dns_client::client::{AsyncClient, ClientHandle};
-use trust_dns_client::op::{Message, Edns};
+use trust_dns_client::op::{Edns, Message};
 use trust_dns_client::rr::Record;
 use trust_dns_client::serialize::binary::{BinDecodable, BinEncodable};
 use trust_dns_client::udp::UdpClientStream;
 
-use trust_dns_server::authority::{MessageRequest, MessageResponse, MessageResponseBuilder, Catalog};
+use trust_dns_server::authority::{MessageRequest, MessageResponse, MessageResponseBuilder};
 use trust_dns_server::server::{Request, RequestHandler, ResponseHandler};
 
 use async_trait::async_trait;
 
-use tracing::instrument;
+use tracing::{info_span, instrument, Instrument};
 
-type RecordBoxedIter<'a> = Box<dyn Iterator<Item=&'a Record> + Send + 'a>;
-
-pub enum QueryStatus<T> {
-    Resolved(T),
-    Fallthrough,
-}
-
+type RecordBoxedIter<'a> = Box<dyn Iterator<Item = &'a Record> + Send + 'a>;
 #[async_trait]
 pub trait AsyncQueryHandler: Debug + Send + Sync + 'static {
-    async fn handle_query(&self, _: &mut Message) -> Result<QueryStatus<Message>>;
+    fn with_next(self: Box<Self>, next: Box<dyn AsyncQueryHandler>) -> Box<dyn AsyncQueryHandler>;
+    fn next(&self) -> Option<&Box<dyn AsyncQueryHandler>>;
+
+    async fn next_handler(&self, msg: Message) -> Result<Message> {
+        if let Some(ref handler) = self.next() {
+            return handler.handle_query(msg).await;
+        }
+        Ok(msg)
+    }
+    async fn handle_query(&self, _: Message) -> Result<Message>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct DnsProxy {
-    handlers: Arc<Vec<Box<dyn AsyncQueryHandler>>>,
+    handlers: Arc<dyn AsyncQueryHandler>,
 }
 
 impl DnsProxy {
-    pub fn new(handlers: Vec<Box<dyn AsyncQueryHandler>>) -> Self {
-        DnsProxy {
-            handlers: Arc::new(handlers),
+    pub fn new(handlers: Vec<Box<dyn AsyncQueryHandler>>) -> Result<Self> {
+        let mut first = None;
+        for handler in handlers.into_iter().rev() {
+            first = match first {
+                None => Some(handler),
+                Some(head) => Some(head.with_next(handler)),
+            }
         }
+
+        Ok(DnsProxy {
+            handlers: Arc::from(first.ok_or_else(|| anyhow!("empty handlers chain"))?),
+        })
     }
 }
 
@@ -61,18 +72,35 @@ impl TryIntoMessage for MessageRequest {
 pub struct Upstream {
     upstream: SocketAddr,
     timeout: Duration,
+    next: Option<Box<dyn AsyncQueryHandler>>,
 }
 
 impl Upstream {
     pub fn new(upstream: SocketAddr, timeout: Duration) -> Self {
-        Upstream { upstream, timeout }
+        Upstream {
+            upstream,
+            timeout,
+            next: None,
+        }
     }
 }
 
 #[async_trait]
 impl AsyncQueryHandler for Upstream {
+    fn with_next(
+        mut self: Box<Self>,
+        next: Box<dyn AsyncQueryHandler>,
+    ) -> Box<dyn AsyncQueryHandler> {
+        self.next = Some(next);
+        self
+    }
+
+    fn next(&self) -> Option<&Box<dyn AsyncQueryHandler>> {
+        self.next.as_ref()
+    }
+
     #[instrument(name = "upstream")]
-    async fn handle_query(&self, msg: &mut Message) -> Result<QueryStatus<Message>> {
+    async fn handle_query(&self, msg: Message) -> Result<Message> {
         let conn = UdpClientStream::<UdpSocket>::with_timeout(self.upstream, self.timeout);
         let (mut client, bg) = AsyncClient::connect(conn).await?;
         tokio::spawn(bg);
@@ -81,29 +109,15 @@ impl AsyncQueryHandler for Upstream {
             .first()
             .ok_or(anyhow!("empty queries"))?
             .clone();
-        let resp =
-            client
-                .query(
-                    query.name().clone(),
-                    query.query_class(),
-                    query.query_type(),
-                )
-                .await?;
-        Ok(QueryStatus::Resolved(resp.into()))
-    }
-}
+        let resp = client
+            .query(
+                query.name().clone(),
+                query.query_class(),
+                query.query_type(),
+            )
+            .await?;
 
-#[async_trait]
-impl AsyncQueryHandler for DnsProxy {
-    #[instrument(name = "dnsproxy")]
-    async fn handle_query(&self, msg: &mut Message) -> Result<QueryStatus<Message>> {
-        for handler in self.handlers.iter() {
-            match handler.handle_query(msg).await? {
-                QueryStatus::Fallthrough => continue,
-                result => return Ok(result),
-            }
-        }
-        Ok(QueryStatus::Fallthrough)
+        self.next_handler(resp.into()).await
     }
 }
 
@@ -119,10 +133,7 @@ fn make_err_msg_response(req: &Request) -> MessageResponse<'_, 'static> {
     make_response_builder(req).error_msg(message.id(), message.op_code(), message.response_code())
 }
 
-fn make_forward_response<'q, 'a>(
-    req: &'q Request,
-    resp: &'a Message,
-) -> MessageResponse<'q, 'a> {
+fn make_forward_response<'q, 'a>(req: &'q Request, resp: &'a Message) -> MessageResponse<'q, 'a> {
     let builder = make_response_builder(req);
     let req = &req.message;
     let mut resp = builder.build(
@@ -162,36 +173,28 @@ macro_rules! try_handle {
 }
 
 impl RequestHandler for DnsProxy {
-    type ResponseFuture = Pin<Box<dyn Future<Output=()> + Send>>;
+    type ResponseFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
     fn handle_request<R: ResponseHandler>(
         &self,
         request: Request,
         mut response_handle: R,
     ) -> Self::ResponseFuture {
-        Catalog::new();
         let clone = self.clone();
-        Box::pin(async move {
-            let mut message = try_handle!(
-                request = request,
-                handle = response_handle,
-                result = request.message.try_into_message()
-            );
-            match try_handle!(
-                request = request,
-                handle = response_handle,
-                result = clone.handle_query(&mut message).await
-            ) {
-                QueryStatus::Fallthrough => {
-                    try_handle!(
-                        request = request,
-                        handle = response_handle,
-                        result = Err(())
-                    );
-                }
-                QueryStatus::Resolved(ref result) => {
-                    let _ = response_handle.send_response(make_forward_response(&request, result));
-                }
-            };
-        })
+        Box::pin(
+            (async move {
+                let message = try_handle!(
+                    request = request,
+                    handle = response_handle,
+                    result = request.message.try_into_message()
+                );
+                let resp = try_handle!(
+                    request = request,
+                    handle = response_handle,
+                    result = clone.handlers.handle_query(message).await
+                );
+                let _ = response_handle.send_response(make_forward_response(&request, &resp));
+            })
+            .instrument(info_span!("handle_request")),
+        )
     }
 }
